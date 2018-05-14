@@ -2,17 +2,19 @@ package ocsp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	"encoding/base64"
 	"github.com/cloudflare/cfssl/api"
 	"github.com/cloudflare/cfssl/ocsp"
 	goocsp "golang.org/x/crypto/ocsp"
-	"time"
+
+	"github.com/cloudflare/cfssl/helpers"
 )
 
 const (
@@ -41,7 +43,7 @@ func newSignServer(t *testing.T) *httptest.Server {
 	return ts
 }
 
-func testSignFile(t *testing.T, certFile, status string, reason int, revokedAt string) (resp *http.Response, body []byte) {
+func testSignFile(t *testing.T, certFile, status string, reason int, revokedAt string, hash string) (resp *http.Response, body []byte) {
 	ts := newSignServer(t)
 	defer ts.Close()
 
@@ -60,6 +62,7 @@ func testSignFile(t *testing.T, certFile, status string, reason int, revokedAt s
 	if revokedAt != "" {
 		obj["revoked_at"] = revokedAt
 	}
+	obj["issuer_hash"] = hash
 
 	blob, err := json.Marshal(obj)
 	if err != nil {
@@ -85,6 +88,7 @@ type signTest struct {
 	ExpectedHTTPStatus int
 	ExpectedSuccess    bool
 	ExpectedErrorCode  int
+	IssuerHash         string
 }
 
 var signTests = []signTest{
@@ -140,11 +144,25 @@ var signTests = []signTest{
 		ExpectedSuccess:    false,
 		ExpectedErrorCode:  8200,
 	},
+	{
+		CertificateFile:    testCertFile,
+		IssuerHash:         "SHA256",
+		ExpectedHTTPStatus: http.StatusOK,
+		ExpectedSuccess:    true,
+		ExpectedErrorCode:  0,
+	},
+	{
+		CertificateFile:    testCertFile,
+		IssuerHash:         "MD4",
+		ExpectedHTTPStatus: http.StatusBadRequest,
+		ExpectedSuccess:    false,
+		ExpectedErrorCode:  http.StatusBadRequest,
+	},
 }
 
 func TestSign(t *testing.T) {
 	for i, test := range signTests {
-		resp, body := testSignFile(t, test.CertificateFile, test.Status, test.Reason, test.RevokedAt)
+		resp, body := testSignFile(t, test.CertificateFile, test.Status, test.Reason, test.RevokedAt, test.IssuerHash)
 		if resp.StatusCode != test.ExpectedHTTPStatus {
 			t.Logf("Test %d: expected: %d, have %d", i, test.ExpectedHTTPStatus, resp.StatusCode)
 			t.Fatal(resp.Status, test.ExpectedHTTPStatus, string(body))
@@ -210,21 +228,13 @@ func TestSign(t *testing.T) {
 
 			var r time.Time
 			if test.RevokedAt == "" || test.RevokedAt == "now" {
-				r = time.Now()
+				r = time.Now().UTC().Truncate(helpers.OneDay)
 			} else {
 				r, _ = time.Parse("2006-01-02", test.RevokedAt)
 			}
 
-			if ocspResp.RevokedAt.Year() != r.Year() {
-				t.Fatalf("Test %d incorrect revokedAt: expected: %v, have %v", i, test.RevokedAt, ocspResp.RevokedAt)
-				t.Fatal(ocspResp.RevokedAt, test.RevokedAt, ocspResp)
-			}
-			if ocspResp.RevokedAt.Month() != r.Month() {
-				t.Fatalf("Test %d incorrect revokedAt: expected: %v, have %v", i, test.RevokedAt, ocspResp.RevokedAt)
-				t.Fatal(ocspResp.RevokedAt, test.RevokedAt, ocspResp)
-			}
-			if ocspResp.RevokedAt.Day() != r.Day() {
-				t.Fatalf("Test %d incorrect revokedAt: expected: %v, have %v", i, test.RevokedAt, ocspResp.RevokedAt)
+			if !ocspResp.RevokedAt.Truncate(helpers.OneDay).Equal(r) {
+				t.Fatalf("Test %d incorrect revokedAt: expected: %v, have %v", i, r, ocspResp.RevokedAt)
 				t.Fatal(ocspResp.RevokedAt, test.RevokedAt, ocspResp)
 			}
 		}

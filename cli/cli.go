@@ -17,6 +17,7 @@ The commands are defined in the cli subpackages and include
 	version	 prints the current cfssl version
 	genkey   generates a key and an associated CSR
 	gencert  generates a key and a signed certificate
+	gencsr   generates a certificate request
 	selfsign generates a self-signed certificate
 	ocspsign signs an OCSP response
 
@@ -24,6 +25,7 @@ Use "cfssl [command] -help" to find out more about a command.
 */
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -31,7 +33,6 @@ import (
 	"io/ioutil"
 	"os"
 
-	"encoding/base64"
 	"github.com/cloudflare/cfssl/config"
 )
 
@@ -113,6 +114,8 @@ func Start(cmds map[string]*Command) error {
 		flag.Usage()
 		return errors.New("undefined command")
 	}
+	// always have flag 'loglevel' for each command
+	cmd.Flags = append(cmd.Flags, "loglevel")
 	// The usage of each individual command is re-written to mention
 	// flags defined and referenced only in that command.
 	cfsslFlagSet.Usage = func() {
@@ -129,10 +132,12 @@ func Start(cmds map[string]*Command) error {
 	args = cfsslFlagSet.Args()
 
 	var err error
-	c.CFG, err = config.LoadFile(c.ConfigFile)
-	if c.ConfigFile != "" && err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config file: %v", err)
-		return errors.New("failed to load config file")
+	if c.ConfigFile != "" {
+		c.CFG, err = config.LoadFile(c.ConfigFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to load config file: %v", err)
+			return errors.New("failed to load config file")
+		}
 	}
 
 	if err := cmd.Main(args, c); err != nil {
@@ -184,4 +189,11 @@ func PrintOCSPResponse(resp []byte) {
 		return
 	}
 	fmt.Printf("%s\n", jsonOut)
+}
+
+// PrintCRL outputs the CRL to stdout
+func PrintCRL(certList []byte) {
+	b64Resp := base64.StdEncoding.EncodeToString(certList)
+
+	fmt.Printf("%s\n", b64Resp)
 }

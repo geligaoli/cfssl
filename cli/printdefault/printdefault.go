@@ -22,7 +22,7 @@ func printAvailable() {
 }
 
 func printDefaults(args []string, c cli.Config) (err error) {
-	arg, args, err := cli.PopFirstArgument(args)
+	arg, _, err := cli.PopFirstArgument(args)
 	if err != nil {
 		return
 	}
@@ -40,7 +40,7 @@ func printDefaults(args []string, c cli.Config) (err error) {
 	return
 }
 
-// Command is exported for use by the CLI.
+// Command assembles the definition of Command 'print-defaults'
 var Command = &cli.Command{
 	UsageText: printDefaultsUsage,
 	Flags:     []string{},

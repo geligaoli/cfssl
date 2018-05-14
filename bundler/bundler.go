@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	goerr "errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -26,9 +27,10 @@ import (
 	"github.com/cloudflare/cfssl/ubiquity"
 )
 
-// intermediateStash contains the path to the directory where
+// IntermediateStash contains the path to the directory where
 // downloaded intermediates should be saved.
-var IntermediateStash = "intermediates"
+// When unspecified, downloaded intermediates are not saved.
+var IntermediateStash string
 
 // BundleFlavor is named optimization strategy on certificate chain selection when bundling.
 type BundleFlavor string
@@ -61,47 +63,79 @@ type Bundler struct {
 	RootPool         *x509.CertPool
 	IntermediatePool *x509.CertPool
 	KnownIssuers     map[string]bool
+	opts             options
+}
+
+type options struct {
+	keyUsages []x509.ExtKeyUsage
+}
+
+var defaultOptions = options{
+	keyUsages: []x509.ExtKeyUsage{
+		x509.ExtKeyUsageAny,
+	},
+}
+
+// An Option sets options such as allowed key usages, etc.
+type Option func(*options)
+
+// WithKeyUsages lets you set which Extended Key Usage values are acceptable. By
+// default x509.ExtKeyUsageAny will be used.
+func WithKeyUsages(usages ...x509.ExtKeyUsage) Option {
+	return func(o *options) {
+		o.keyUsages = usages
+	}
 }
 
 // NewBundler creates a new Bundler from the files passed in; these
 // files should contain a list of valid root certificates and a list
 // of valid intermediate certificates, respectively.
-func NewBundler(caBundleFile, intBundleFile string) (*Bundler, error) {
-	log.Debug("Loading CA bundle: ", caBundleFile)
-	caBundle, err := ioutil.ReadFile(caBundleFile)
-	if err != nil {
-		log.Errorf("root bundle failed to load: %v", err)
-		return nil, errors.Wrap(errors.RootError, errors.ReadFailed, err)
-	}
+func NewBundler(caBundleFile, intBundleFile string, opt ...Option) (*Bundler, error) {
+	var caBundle, intBundle []byte
+	var err error
 
-	log.Debug("Loading Intermediate bundle: ", intBundleFile)
-	intBundle, err := ioutil.ReadFile(intBundleFile)
-	if err != nil {
-		log.Errorf("intermediate bundle failed to load: %v", err)
-		return nil, errors.Wrap(errors.IntermediatesError, errors.ReadFailed, err)
-	}
-
-	if _, err := os.Stat(IntermediateStash); err != nil && os.IsNotExist(err) {
-		log.Infof("intermediate stash directory %s doesn't exist, creating", IntermediateStash)
-		err = os.MkdirAll(IntermediateStash, 0755)
+	if caBundleFile != "" {
+		log.Debug("Loading CA bundle: ", caBundleFile)
+		caBundle, err = ioutil.ReadFile(caBundleFile)
 		if err != nil {
-			log.Errorf("failed to create intermediate stash directory %s: %v",
-				IntermediateStash, err)
-			return nil, err
+			log.Errorf("root bundle failed to load: %v", err)
+			return nil, errors.Wrap(errors.RootError, errors.ReadFailed, err)
 		}
-		log.Infof("intermediate stash directory %s created", IntermediateStash)
 	}
-	return NewBundlerFromPEM(caBundle, intBundle)
+
+	if intBundleFile != "" {
+		log.Debug("Loading Intermediate bundle: ", intBundleFile)
+		intBundle, err = ioutil.ReadFile(intBundleFile)
+		if err != nil {
+			log.Errorf("intermediate bundle failed to load: %v", err)
+			return nil, errors.Wrap(errors.IntermediatesError, errors.ReadFailed, err)
+		}
+	}
+
+	if IntermediateStash != "" {
+		if _, err = os.Stat(IntermediateStash); err != nil && os.IsNotExist(err) {
+			log.Infof("intermediate stash directory %s doesn't exist, creating", IntermediateStash)
+			err = os.MkdirAll(IntermediateStash, 0755)
+			if err != nil {
+				log.Errorf("failed to create intermediate stash directory %s: %v",
+					IntermediateStash, err)
+				return nil, err
+			}
+			log.Infof("intermediate stash directory %s created", IntermediateStash)
+		}
+	}
+
+	return NewBundlerFromPEM(caBundle, intBundle, opt...)
 
 }
 
 // NewBundlerFromPEM creates a new Bundler from PEM-encoded root certificates and
 // intermediate certificates.
-func NewBundlerFromPEM(caBundlePEM, intBundlePEM []byte) (*Bundler, error) {
-	b := &Bundler{
-		RootPool:         x509.NewCertPool(),
-		IntermediatePool: x509.NewCertPool(),
-		KnownIssuers:     map[string]bool{},
+// If caBundlePEM is nil, the resulting Bundler can only do "Force" bundle.
+func NewBundlerFromPEM(caBundlePEM, intBundlePEM []byte, opt ...Option) (*Bundler, error) {
+	opts := defaultOptions
+	for _, o := range opt {
+		o(&opts)
 	}
 
 	log.Debug("parsing root certificates from PEM")
@@ -112,13 +146,27 @@ func NewBundlerFromPEM(caBundlePEM, intBundlePEM []byte) (*Bundler, error) {
 	}
 
 	log.Debug("parse intermediate certificates from PEM")
-	var intermediates []*x509.Certificate
-	if intermediates, err = helpers.ParseCertificatesPEM(intBundlePEM); err != nil {
+	intermediates, err := helpers.ParseCertificatesPEM(intBundlePEM)
+	if err != nil {
 		log.Errorf("failed to parse intermediate bundle: %v", err)
 		return nil, errors.New(errors.IntermediatesError, errors.ParseFailed)
 	}
 
+	b := &Bundler{
+		KnownIssuers:     map[string]bool{},
+		IntermediatePool: x509.NewCertPool(),
+		opts:             opts,
+	}
+
 	log.Debug("building certificate pools")
+
+	// RootPool will be nil if caBundlePEM is nil, also
+	// that translates to caBundleFile is "".
+	// Systems root store will be used.
+	if caBundlePEM != nil {
+		b.RootPool = x509.NewCertPool()
+	}
+
 	for _, c := range roots {
 		b.RootPool.AddCert(c)
 		b.KnownIssuers[string(c.Signature)] = true
@@ -139,11 +187,7 @@ func (b *Bundler) VerifyOptions() x509.VerifyOptions {
 	return x509.VerifyOptions{
 		Roots:         b.RootPool,
 		Intermediates: b.IntermediatePool,
-		KeyUsages: []x509.ExtKeyUsage{
-			x509.ExtKeyUsageServerAuth,
-			x509.ExtKeyUsageMicrosoftServerGatedCrypto,
-			x509.ExtKeyUsageNetscapeServerGatedCrypto,
-		},
+		KeyUsages:     b.opts.keyUsages,
 	}
 }
 
@@ -388,17 +432,19 @@ func (b *Bundler) verifyChain(chain []*fetchedIntermediate) bool {
 		b.IntermediatePool.AddCert(cert.Cert)
 		b.KnownIssuers[string(cert.Cert.Signature)] = true
 
-		fileName := filepath.Join(IntermediateStash, cert.Name)
+		if IntermediateStash != "" {
+			fileName := filepath.Join(IntermediateStash, cert.Name)
 
-		var block = pem.Block{Type: "CERTIFICATE", Bytes: cert.Cert.Raw}
+			var block = pem.Block{Type: "CERTIFICATE", Bytes: cert.Cert.Raw}
 
-		log.Debugf("write intermediate to stash directory: %s", fileName)
-		// If the write fails, verification should not fail.
-		err = ioutil.WriteFile(fileName, pem.EncodeToMemory(&block), 0644)
-		if err != nil {
-			log.Errorf("failed to write new intermediate: %v", err)
-		} else {
-			log.Info("stashed new intermediate ", cert.Name)
+			log.Debugf("write intermediate to stash directory: %s", fileName)
+			// If the write fails, verification should not fail.
+			err = ioutil.WriteFile(fileName, pem.EncodeToMemory(&block), 0644)
+			if err != nil {
+				log.Errorf("failed to write new intermediate: %v", err)
+			} else {
+				log.Info("stashed new intermediate ", cert.Name)
+			}
 		}
 	}
 	return true
@@ -427,17 +473,18 @@ func constructCertFileName(cert *x509.Certificate) string {
 // issuer is not trusted, fetching the certicate here will not change
 // that.
 func (b *Bundler) fetchIntermediates(certs []*x509.Certificate) (err error) {
-	log.Debugf("searching intermediates")
-	if _, err := os.Stat(IntermediateStash); err != nil && os.IsNotExist(err) {
-		log.Infof("intermediate stash directory %s doesn't exist, creating", IntermediateStash)
-		err = os.MkdirAll(IntermediateStash, 0755)
-		if err != nil {
-			log.Errorf("failed to create intermediate stash directory %s: %v", IntermediateStash, err)
-			return err
+	if IntermediateStash != "" {
+		log.Debugf("searching intermediates")
+		if _, err := os.Stat(IntermediateStash); err != nil && os.IsNotExist(err) {
+			log.Infof("intermediate stash directory %s doesn't exist, creating", IntermediateStash)
+			err = os.MkdirAll(IntermediateStash, 0755)
+			if err != nil {
+				log.Errorf("failed to create intermediate stash directory %s: %v", IntermediateStash, err)
+				return err
+			}
+			log.Infof("intermediate stash directory %s created", IntermediateStash)
 		}
-		log.Infof("intermediate stash directory %s created", IntermediateStash)
 	}
-
 	// stores URLs and certificate signatures that have been seen
 	seen := map[string]bool{}
 	var foundChains int
@@ -455,7 +502,7 @@ func (b *Bundler) fetchIntermediates(certs []*x509.Certificate) (err error) {
 			name = constructCertFileName(cert)
 		}
 
-		chain = append([]*fetchedIntermediate{&fetchedIntermediate{cert, name}}, chain...)
+		chain = append([]*fetchedIntermediate{{cert, name}}, chain...)
 		seen[string(cert.Signature)] = true
 	}
 
@@ -563,6 +610,13 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 	bundle.buildHostnames()
 
 	if flavor == Force {
+		// force bundle checks the certificates
+		// forms a verification chain.
+		if !partialVerify(certs) {
+			return nil,
+				errors.Wrap(errors.CertificateError, errors.VerifyFailed,
+					goerr.New("Unable to verify the certificate chain"))
+		}
 		bundle.Chain = certs
 	} else {
 		// disallow self-signed cert
@@ -570,27 +624,20 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 			return nil, errors.New(errors.CertificateError, errors.SelfSigned)
 		}
 
-		// verify and store input intermediates to the intermediate pool.
-		// Ignore the returned error here, will treat it in the second call.
-		b.fetchIntermediates(certs)
-
 		chains, err := cert.Verify(b.VerifyOptions())
 		if err != nil {
 			log.Debugf("verification failed: %v", err)
 			// If the error was an unknown authority, try to fetch
 			// the intermediate specified in the AIA and add it to
 			// the intermediates bundle.
-			switch err := err.(type) {
-			case x509.UnknownAuthorityError:
-				// Do nothing -- have the default case return out.
-			default:
+			if _, ok := err.(x509.UnknownAuthorityError); !ok {
 				return nil, errors.Wrap(errors.CertificateError, errors.VerifyFailed, err)
 			}
 
 			log.Debugf("searching for intermediates via AIA issuer")
-			err = b.fetchIntermediates(certs)
-			if err != nil {
-				log.Debugf("search failed: %v", err)
+			searchErr := b.fetchIntermediates(certs)
+			if searchErr != nil {
+				log.Debugf("search failed: %v", searchErr)
 				return nil, errors.Wrap(errors.CertificateError, errors.VerifyFailed, err)
 			}
 
@@ -622,7 +669,6 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 	var messages []string
 	// Check if bundle is expiring.
 	expiringCerts := checkExpiringCerts(bundle.Chain)
-	bundle.Expires = helpers.ExpiryTime(bundle.Chain)
 	if len(expiringCerts) > 0 {
 		statusCode |= errors.BundleExpiringBit
 		messages = append(messages, expirationWarning(expiringCerts))
@@ -679,6 +725,8 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 	}
 
 	bundle.Status.IsRebundled = diff(bundle.Chain, certs)
+	bundle.Expires = helpers.ExpiryTime(bundle.Chain)
+	bundle.LeafExpires = bundle.Chain[0].NotAfter
 
 	log.Debugf("bundle complete")
 	return bundle, nil

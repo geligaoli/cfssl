@@ -34,14 +34,14 @@ var defaults = map[string]string{
         "www.example.net"
     ],
     "key": {
-        "algo": "rsa",
-        "size": 2048
+        "algo": "ecdsa",
+        "size": 256
     },
     "names": [
         {
             "C": "US",
-            "L": "CA",
-            "ST": "San Francisco"
+            "ST": "CA",
+            "L": "San Francisco"
         }
     ]
 }

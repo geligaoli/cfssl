@@ -1,14 +1,16 @@
-// Package client implements the a Go client for CFSSL API commands.
+// Package client implements a Go client for CFSSL API commands.
 package client
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	stderr "errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -22,8 +24,11 @@ import (
 
 // A server points to a single remote CFSSL instance.
 type server struct {
-	Address string
-	Port    int
+	URL            string
+	TLSConfig      *tls.Config
+	reqModifier    func(*http.Request, []byte)
+	RequestTimeout time.Duration
+	proxy          func(*http.Request) (*url.URL, error)
 }
 
 // A Remote points to at least one (but possibly multiple) remote
@@ -36,21 +41,35 @@ type Remote interface {
 	Sign(jsonData []byte) ([]byte, error)
 	Info(jsonData []byte) (*info.Resp, error)
 	Hosts() []string
+	SetReqModifier(func(*http.Request, []byte))
+	SetRequestTimeout(d time.Duration)
+	SetProxy(func(*http.Request) (*url.URL, error))
 }
 
-// NewServer sets up a new server target. The address should be the
-// DNS name (or "name:port") of the remote CFSSL instance. If no port
+// NewServer sets up a new server target. The address should be of
+// The format [protocol:]name[:port] of the remote CFSSL instance.
+// If no protocol is given http is default. If no port
 // is specified, the CFSSL default port (8888) is used. If the name is
 // a comma-separated list of hosts, an ordered group will be returned.
 func NewServer(addr string) Remote {
+	return NewServerTLS(addr, nil)
+}
+
+// NewServerTLS is the TLS version of NewServer
+func NewServerTLS(addr string, tlsConfig *tls.Config) Remote {
 	addrs := strings.Split(addr, ",")
 
 	var remote Remote
 
 	if len(addrs) > 1 {
-		remote, _ = NewGroup(addrs, StrategyOrderedList)
+		remote, _ = NewGroup(addrs, tlsConfig, StrategyOrderedList)
 	} else {
-		srv := newServer(addr)
+		u, err := normalizeURL(addrs[0])
+		if err != nil {
+			log.Errorf("bad url: %v", err)
+			return nil
+		}
+		srv := newServer(u, tlsConfig)
 		if srv != nil {
 			remote = srv
 		}
@@ -59,50 +78,78 @@ func NewServer(addr string) Remote {
 }
 
 func (srv *server) Hosts() []string {
-	return []string{net.JoinHostPort(srv.Address, fmt.Sprintf("%d", srv.Port))}
+	return []string{srv.URL}
 }
 
-func newServer(addr string) *server {
-	addr = strings.TrimSpace(addr)
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		host, port, err = net.SplitHostPort(addr + ":8888")
-		if err != nil {
-			return nil
-		}
-	}
+func (srv *server) SetReqModifier(mod func(*http.Request, []byte)) {
+	srv.reqModifier = mod
+}
 
-	var portno int
-	if port == "" {
-		portno = 8888
-	} else {
-		portno, err = strconv.Atoi(port)
-		if err != nil {
-			return nil
-		}
-	}
+func (srv *server) SetRequestTimeout(timeout time.Duration) {
+	srv.RequestTimeout = timeout
+}
 
-	return &server{host, portno}
+func (srv *server) SetProxy(proxy func(*http.Request) (*url.URL, error)) {
+	srv.proxy = proxy
+}
+
+func newServer(u *url.URL, tlsConfig *tls.Config) *server {
+	URL := u.String()
+	return &server{
+		URL:       URL,
+		TLSConfig: tlsConfig,
+	}
 }
 
 func (srv *server) getURL(endpoint string) string {
-	return fmt.Sprintf("http://%s:%d/api/v1/cfssl/%s", srv.Address, srv.Port, endpoint)
+	return fmt.Sprintf("%s/api/v1/cfssl/%s", srv.URL, endpoint)
+}
+
+func (srv *server) createTransport() (transport *http.Transport) {
+	transport = new(http.Transport)
+	// Setup HTTPS client
+	tlsConfig := srv.TLSConfig
+	tlsConfig.BuildNameToCertificate()
+	transport.TLSClientConfig = tlsConfig
+	// Setup Proxy
+	transport.Proxy = srv.proxy
+	return transport
 }
 
 // post connects to the remote server and returns a Response struct
 func (srv *server) post(url string, jsonData []byte) (*api.Response, error) {
-	buf := bytes.NewBuffer(jsonData)
-	resp, err := http.Post(url, "application/json", buf)
+	var resp *http.Response
+	var err error
+	client := &http.Client{}
+	if srv.TLSConfig != nil {
+		client.Transport = srv.createTransport()
+	}
+	if srv.RequestTimeout != 0 {
+		client.Timeout = srv.RequestTimeout
+	}
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonData))
 	if err != nil {
+		err = fmt.Errorf("failed POST to %s: %v", url, err)
 		return nil, errors.Wrap(errors.APIClientError, errors.ClientHTTPError, err)
 	}
+	req.Close = true
+	req.Header.Set("content-type", "application/json")
+	if srv.reqModifier != nil {
+		srv.reqModifier(req, jsonData)
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		err = fmt.Errorf("failed POST to %s: %v", url, err)
+		return nil, errors.Wrap(errors.APIClientError, errors.ClientHTTPError, err)
+	}
+	defer req.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, errors.Wrap(errors.APIClientError, errors.IOError, err)
 	}
-	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		log.Errorf("http error with %s", url)
 		return nil, errors.Wrap(errors.APIClientError, errors.ClientHTTPError, stderr.New(string(body)))
 	}
 
@@ -202,10 +249,10 @@ func (srv *server) Info(jsonData []byte) (*info.Resp, error) {
 		info.Certificate = val.(string)
 	}
 	var usages []interface{}
-	if val, ok := res["usages"]; ok {
+	if val, ok := res["usages"]; ok && val != nil {
 		usages = val.([]interface{})
 	}
-	if val, ok := res["expiry"]; ok {
+	if val, ok := res["expiry"]; ok && val != nil {
 		info.ExpiryString = val.(string)
 	}
 
@@ -244,4 +291,66 @@ func (srv *server) request(jsonData []byte, target string) ([]byte, error) {
 	}
 
 	return nil, errors.Wrap(errors.APIClientError, errors.ClientHTTPError, stderr.New("response doesn't contain certificate."))
+}
+
+// AuthRemote acts as a Remote with a default Provider for AuthSign.
+type AuthRemote struct {
+	Remote
+	provider auth.Provider
+}
+
+// NewAuthServer sets up a new auth server target with an addr
+// in the same format at NewServer and a default authentication provider to
+// use for Sign requests.
+func NewAuthServer(addr string, tlsConfig *tls.Config, provider auth.Provider) *AuthRemote {
+	return &AuthRemote{
+		Remote:   NewServerTLS(addr, tlsConfig),
+		provider: provider,
+	}
+}
+
+// Sign is overloaded to perform an AuthSign request using the default auth provider.
+func (ar *AuthRemote) Sign(req []byte) ([]byte, error) {
+	return ar.AuthSign(req, nil, ar.provider)
+}
+
+// nomalizeURL checks for http/https protocol, appends "http" as default protocol if not defiend in url
+func normalizeURL(addr string) (*url.URL, error) {
+	addr = strings.TrimSpace(addr)
+
+	u, err := url.Parse(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	if u.Opaque != "" {
+		u.Host = net.JoinHostPort(u.Scheme, u.Opaque)
+		u.Opaque = ""
+	} else if u.Path != "" && !strings.Contains(u.Path, ":") {
+		u.Host = net.JoinHostPort(u.Path, "8888")
+		u.Path = ""
+	} else if u.Scheme == "" {
+		u.Host = u.Path
+		u.Path = ""
+	}
+
+	if u.Scheme != "https" {
+		u.Scheme = "http"
+	}
+
+	_, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		_, port, err = net.SplitHostPort(u.Host + ":8888")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if port != "" {
+		_, err = strconv.Atoi(port)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return u, nil
 }

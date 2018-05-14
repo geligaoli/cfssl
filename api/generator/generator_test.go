@@ -6,8 +6,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/cloudflare/cfssl/api"
+	"github.com/cloudflare/cfssl/config"
 	"github.com/cloudflare/cfssl/csr"
+	"github.com/cloudflare/cfssl/signer/local"
+)
+
+const (
+	testCaFile    = "testdata/ca.pem"
+	testCaKeyFile = "testdata/ca_key.pem"
+	testCABundle  = "../../bundler/testdata/ca-bundle.pem"
+	testIntBundle = "../../bundler/testdata/int-bundle.pem"
 )
 
 func csrData(t *testing.T) *bytes.Reader {
@@ -21,8 +32,8 @@ func csrData(t *testing.T) *bytes.Reader {
 				OU: "Systems Engineering",
 			},
 		},
-		CN:    "cloudflare.com",
-		Hosts: []string{"cloudflare.com"},
+		CN:         "cloudflare.com",
+		Hosts:      []string{"cloudflare.com"},
 		KeyRequest: csr.NewBasicKeyRequest(),
 	}
 	csrBytes, err := json.Marshal(req)
@@ -63,5 +74,72 @@ func TestGeneratorRESTfulVerbs(t *testing.T) {
 	resp, _ = http.DefaultClient.Do(req)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatal(resp.Status)
+	}
+}
+
+func TestCSRValidate(t *testing.T) {
+	req := &csr.CertificateRequest{
+		Names: []csr.Name{
+			{
+				C:  "US",
+				ST: "California",
+				L:  "San Francisco",
+				O:  "CloudFlare",
+				OU: "Systems Engineering",
+			},
+		},
+		CN:         "cloudflare.com",
+		Hosts:      []string{},
+		KeyRequest: csr.NewBasicKeyRequest(),
+	}
+	err := CSRValidate(req)
+	if err != nil {
+		t.Fatal("There should be not an error for missing Hosts parameter")
+	}
+}
+
+func TestNewCertGeneratorHandlerFromSigner(t *testing.T) {
+	var expiry = 1 * time.Minute
+	var CAConfig = &config.Config{
+		Signing: &config.Signing{
+			Profiles: map[string]*config.SigningProfile{
+				"signature": {
+					Usage:  []string{"digital signature"},
+					Expiry: expiry,
+				},
+			},
+			Default: &config.SigningProfile{
+				Usage:        []string{"cert sign", "crl sign"},
+				ExpiryString: "43800h",
+				Expiry:       expiry,
+				CAConstraint: config.CAConstraint{IsCA: true},
+
+				ClientProvidesSerialNumbers: true,
+			},
+		},
+	}
+	s, err := local.NewSignerFromFile(testCaFile, testCaKeyFile, CAConfig.Signing)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewCertGeneratorHandlerFromSigner(CSRValidate, s)
+	_, ok := h.(http.Handler)
+	if !ok {
+		t.Fatal("A HTTP handler has not been returned")
+	}
+
+	apiH, ok := h.(api.HTTPHandler)
+	if !ok {
+		t.Fatal("An api.HTTPHandler has not been returned")
+	}
+
+	cg, ok := apiH.Handler.(*CertGeneratorHandler)
+	if !ok {
+		t.Fatal("A CertGeneratorHandler has not been set")
+	}
+
+	if err := cg.SetBundler(testCABundle, testIntBundle); err != nil {
+		t.Fatal(err)
 	}
 }

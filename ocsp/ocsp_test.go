@@ -1,10 +1,11 @@
 package ocsp
 
 import (
-	"golang.org/x/crypto/ocsp"
 	"io/ioutil"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
 
 	"github.com/cloudflare/cfssl/helpers"
 )
@@ -17,10 +18,6 @@ const (
 	brokenServerKey     = "testdata/server_broken.key"
 	wrongServerCertFile = "testdata/server.crt"
 	wrongServerKeyFile  = "testdata/server.key"
-	responseFile        = "testdata/resp64.pem"
-	binResponseFile     = "testdata/response.pem"
-	brokenResponseFile  = "testdata/response_broken.pem"
-	mixResponseFile     = "testdata/response_mix.pem"
 )
 
 func TestNewSignerFromFile(t *testing.T) {
@@ -125,6 +122,10 @@ func TestSign(t *testing.T) {
 	}
 
 	sMismatch, err := NewSignerFromFile(wrongServerCertFile, otherCertFile, wrongServerKeyFile, dur)
+	if err != nil {
+		t.Fatal("NewSigner failed:", err)
+	}
+
 	_, err = sMismatch.Sign(req)
 	if err == nil {
 		t.Fatal("Signed a certificate from the wrong issuer")
@@ -145,33 +146,65 @@ func TestSign(t *testing.T) {
 	}
 }
 
-func TestNewSourceFromFile(t *testing.T) {
-	_, err := NewSourceFromFile("")
-	if err == nil {
-		t.Fatal("Didn't fail on non-file input")
+func TestSignCustomInterval(t *testing.T) {
+	req, _ := setup(t)
+	dur := time.Hour
+
+	s, err := NewSignerFromFile(serverCertFile, serverCertFile, serverKeyFile, dur)
+	if err != nil {
+		t.Fatalf("Signer creation failed: %v", err)
 	}
 
-	// expected case
-	_, err = NewSourceFromFile(responseFile)
+	// default case
+	n := time.Now().UTC().Truncate(time.Hour)
+	respBytes, err := s.Sign(req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Error signing default request: %s", err)
+	}
+	resp, err := ocsp.ParseResponse(respBytes, nil)
+	if err != nil {
+		t.Fatalf("Error parsing response: %s", err)
+	}
+	if !resp.ThisUpdate.Equal(n) {
+		t.Fatalf("Unexpected ThisUpdate: wanted %s, got %s", n, resp.ThisUpdate)
+	}
+	if !resp.NextUpdate.Equal(n.Add(dur)) {
+		t.Fatalf("Unexpected NextUpdate: wanted %s, got %s", n.Add(dur), resp.NextUpdate)
 	}
 
-	// binary-formatted file
-	_, err = NewSourceFromFile(binResponseFile)
+	// custom case, ThisUpdate only
+	this := time.Now().UTC().Add(-time.Hour * 5).Truncate(time.Hour)
+	req.ThisUpdate = &this
+	respBytes, err = s.Sign(req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Error signing default request: %s", err)
+	}
+	resp, err = ocsp.ParseResponse(respBytes, nil)
+	if err != nil {
+		t.Fatalf("Error parsing response: %s", err)
+	}
+	if !resp.ThisUpdate.Equal(this) {
+		t.Fatalf("Unexpected ThisUpdate: wanted %s, got %s", this, resp.ThisUpdate)
+	}
+	if !resp.NextUpdate.Equal(this.Add(dur)) {
+		t.Fatalf("Unexpected NextUpdate: wanted %s, got %s", this.Add(dur), resp.NextUpdate)
 	}
 
-	// the response file from before, with stuff deleted
-	_, err = NewSourceFromFile(brokenResponseFile)
+	// custom case, ThisUpdate and NextUpdate
+	next := this.Add(time.Hour * 2)
+	req.NextUpdate = &next
+	respBytes, err = s.Sign(req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Error signing default request: %s", err)
 	}
-
-	// mix of a correct and malformed responses
-	_, err = NewSourceFromFile(mixResponseFile)
+	resp, err = ocsp.ParseResponse(respBytes, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Error parsing response: %s", err)
+	}
+	if !resp.ThisUpdate.Equal(this) {
+		t.Fatalf("Unexpected ThisUpdate: wanted %s, got %s", this, resp.ThisUpdate)
+	}
+	if !resp.NextUpdate.Equal(next) {
+		t.Fatalf("Unexpected NextUpdate: wanted %s, got %s", next, resp.NextUpdate)
 	}
 }

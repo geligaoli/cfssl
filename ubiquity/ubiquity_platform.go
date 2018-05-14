@@ -132,6 +132,11 @@ var Platforms []Platform
 // LoadPlatforms reads the file content as a json object array and convert it
 // to Platforms.
 func LoadPlatforms(filename string) error {
+	// if filename is empty, skip the metadata loading
+	if filename == "" {
+		return nil
+	}
+
 	relativePath := filepath.Dir(filename)
 	// Attempt to load root certificate metadata
 	log.Debug("Loading platform metadata: ", filename)
@@ -176,7 +181,7 @@ func UntrustedPlatforms(root *x509.Certificate) []string {
 	return ret
 }
 
-// CrossPlatformUbiquity returns a ubiquity score (persumably relecting the market share in percentage)
+// CrossPlatformUbiquity returns a ubiquity score (presumably relecting the market share in percentage)
 // based on whether the given chain can be verified with the different platforms' root certificate stores.
 func CrossPlatformUbiquity(chain []*x509.Certificate) int {
 	// There is no root store info, every chain is equal weighted as 0.

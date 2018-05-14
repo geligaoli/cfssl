@@ -2,12 +2,12 @@ package scan
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
 
-	"github.com/cloudflare/cf-tls/tls"
 	"github.com/cloudflare/cfssl/helpers"
 )
 
@@ -19,7 +19,7 @@ var TLSHandshake = &Family{
 	Description: "Scans for host's SSL/TLS version and cipher suite negotiation",
 	Scanners: map[string]*Scanner{
 		"CipherSuite": {
-			"Determines host's cipher suites accepted and prefered order",
+			"Determines host's cipher suites accepted and preferred order",
 			cipherSuiteScan,
 		},
 		"SigAlgs": {
@@ -33,6 +33,10 @@ var TLSHandshake = &Family{
 		"CertsByCiphers": {
 			"Determines host's certificate signature algorithm matching client's accepted ciphers",
 			certSigAlgsScanByCipher,
+		},
+		"ECCurves": {
+			"Determines the host's ec curve support for TLS 1.2",
+			ecCurveScan,
 		},
 	},
 }
@@ -82,11 +86,9 @@ func sayHello(addr, hostname string, ciphers []uint16, curves []tls.CurveID, ver
 	if sigAlgs == nil {
 		sigAlgs = tls.AllSignatureAndHashAlgorithms
 	}
-	tls.SetSupportedSKXSignatureAlgorithms(sigAlgs)
-	defer tls.ResetSupportedSKXSignatureAlgorithms()
 
 	conn := tls.Client(tcpConn, config)
-	serverCipher, serverCurveType, serverCurve, serverVersion, certificates, err := conn.SayHello()
+	serverCipher, serverCurveType, serverCurve, serverVersion, certificates, err := conn.SayHello(sigAlgs)
 	certs = certificates
 	conn.Close()
 	if err != nil {
@@ -107,6 +109,7 @@ func sayHello(addr, hostname string, ciphers []uint16, curves []tls.CurveID, ver
 		}
 		if serverCurveType != 3 {
 			err = fmt.Errorf("server negotiated non-named ECDH parameters; we didn't analyze them. Server curve type: %d", serverCurveType)
+			return
 		}
 		curveIndex, err = getCurveIndex(curves, serverCurve)
 	}
@@ -117,6 +120,60 @@ func sayHello(addr, hostname string, ciphers []uint16, curves []tls.CurveID, ver
 func allCiphersIDs() []uint16 {
 	ciphers := make([]uint16, 0, len(tls.CipherSuites))
 	for cipherID := range tls.CipherSuites {
+		ciphers = append(ciphers, cipherID)
+	}
+	return ciphers
+}
+
+func allECDHECiphersIDs() []uint16 {
+	var ecdheCiphers = map[uint16]tls.CipherSuite{
+		0XC006: {Name: "TLS_ECDHE_ECDSA_WITH_NULL_SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC007: {Name: "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA", ShortName: "ECDHE-ECDSA-RC4-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC008: {Name: "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA", ShortName: "ECDHE-ECDSA-DES-CBC3-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC009: {Name: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA", ShortName: "ECDHE-ECDSA-AES128-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC00A: {Name: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA", ShortName: "ECDHE-ECDSA-AES256-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC010: {Name: "TLS_ECDHE_RSA_WITH_NULL_SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC011: {Name: "TLS_ECDHE_RSA_WITH_RC4_128_SHA", ShortName: "ECDHE-RSA-RC4-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC012: {Name: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA", ShortName: "ECDHE-RSA-DES-CBC3-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC013: {Name: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA", ShortName: "ECDHE-RSA-AES128-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC014: {Name: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA", ShortName: "ECDHE-RSA-AES256-SHA", ForwardSecret: true, EllipticCurve: true},
+		0XC023: {Name: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", ShortName: "ECDHE-ECDSA-AES128-SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC024: {Name: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384", ShortName: "ECDHE-ECDSA-AES256-SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC027: {Name: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256", ShortName: "ECDHE-RSA-AES128-SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC028: {Name: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384", ShortName: "ECDHE-RSA-AES256-SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC02B: {Name: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", ShortName: "ECDHE-ECDSA-AES128-GCM-SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC02C: {Name: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", ShortName: "ECDHE-ECDSA-AES256-GCM-SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC02F: {Name: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", ShortName: "ECDHE-RSA-AES128-GCM-SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC030: {Name: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", ShortName: "ECDHE-RSA-AES256-GCM-SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC048: {Name: "TLS_ECDHE_ECDSA_WITH_ARIA_128_CBC_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC049: {Name: "TLS_ECDHE_ECDSA_WITH_ARIA_256_CBC_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC04C: {Name: "TLS_ECDHE_RSA_WITH_ARIA_128_CBC_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC04D: {Name: "TLS_ECDHE_RSA_WITH_ARIA_256_CBC_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC05D: {Name: "TLS_ECDHE_ECDSA_WITH_ARIA_256_GCM_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC060: {Name: "TLS_ECDHE_RSA_WITH_ARIA_128_GCM_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC061: {Name: "TLS_ECDHE_RSA_WITH_ARIA_256_GCM_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC072: {Name: "TLS_ECDHE_ECDSA_WITH_CAMELLIA_128_CBC_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC073: {Name: "TLS_ECDHE_ECDSA_WITH_CAMELLIA_256_CBC_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC076: {Name: "TLS_ECDHE_RSA_WITH_CAMELLIA_128_CBC_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC077: {Name: "TLS_ECDHE_RSA_WITH_CAMELLIA_256_CBC_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC086: {Name: "TLS_ECDHE_ECDSA_WITH_CAMELLIA_128_GCM_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC087: {Name: "TLS_ECDHE_ECDSA_WITH_CAMELLIA_256_GCM_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC08A: {Name: "TLS_ECDHE_RSA_WITH_CAMELLIA_128_GCM_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XC08B: {Name: "TLS_ECDHE_RSA_WITH_CAMELLIA_256_GCM_SHA384", ForwardSecret: true, EllipticCurve: true},
+		0XC08C: {Name: "TLS_ECDH_RSA_WITH_CAMELLIA_128_GCM_SHA256", EllipticCurve: true},
+		0XC0AC: {Name: "TLS_ECDHE_ECDSA_WITH_AES_128_CCM", ForwardSecret: true, EllipticCurve: true},
+		0XC0AD: {Name: "TLS_ECDHE_ECDSA_WITH_AES_256_CCM", ForwardSecret: true, EllipticCurve: true},
+		0XC0AE: {Name: "TLS_ECDHE_ECDSA_WITH_AES_128_CCM_8", ForwardSecret: true, EllipticCurve: true},
+		0XC0AF: {Name: "TLS_ECDHE_ECDSA_WITH_AES_256_CCM_8", ForwardSecret: true, EllipticCurve: true},
+		// Non-IANA standardized cipher suites:
+		// ChaCha20, Poly1305 cipher suites are defined in
+		// https://tools.ietf.org/html/draft-agl-tls-chacha20poly1305-04
+		0XCC13: {Name: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", ForwardSecret: true, EllipticCurve: true},
+		0XCC14: {Name: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", ForwardSecret: true, EllipticCurve: true},
+	}
+
+	ciphers := make([]uint16, 0, len(ecdheCiphers))
+	for cipherID := range ecdheCiphers {
 		ciphers = append(ciphers, cipherID)
 	}
 	return ciphers
@@ -248,7 +305,7 @@ func cipherSuiteScan(addr, hostname string) (grade Grade, output Output, err err
 					goto exists
 				}
 			}
-			cvList = append(cvList, cipherVersions{cipherID, []cipherDatum{cipherDatum{vers, supportedCurves}}})
+			cvList = append(cvList, cipherVersions{cipherID, []cipherDatum{{vers, supportedCurves}}})
 		exists:
 			ciphers = append(ciphers[:cipherIndex], ciphers[cipherIndex+1:]...)
 		}
@@ -340,5 +397,31 @@ func certSigAlgsScanByCipher(addr, hostname string) (grade Grade, output Output,
 	} else {
 		err = errors.New("no cipher supported")
 	}
+	return
+}
+
+// ecCurveScan returns the elliptic curves supported by the host.
+func ecCurveScan(addr, hostname string) (grade Grade, output Output, err error) {
+	allCurves := allCurvesIDs()
+	curves := make([]tls.CurveID, len(allCurves))
+	copy(curves, allCurves)
+	var supportedCurves []string
+	for len(curves) > 0 {
+		var curveIndex int
+		_, curveIndex, _, err = sayHello(addr, hostname, allECDHECiphersIDs(), curves, tls.VersionTLS12, nil)
+		if err != nil {
+			// This case is expected, because eventually we ask only for curves the server doesn't support
+			if err == errHelloFailed {
+				err = nil
+				break
+			}
+			return
+		}
+		curveID := curves[curveIndex]
+		supportedCurves = append(supportedCurves, tls.Curves[curveID])
+		curves = append(curves[:curveIndex], curves[curveIndex+1:]...)
+	}
+	output = supportedCurves
+	grade = Good
 	return
 }

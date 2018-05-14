@@ -11,7 +11,10 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"io/ioutil"
+	"strconv"
+	"strings"
 	"time"
 
 	cferr "github.com/cloudflare/cfssl/errors"
@@ -19,6 +22,21 @@ import (
 	"github.com/cloudflare/cfssl/log"
 	"golang.org/x/crypto/ocsp"
 )
+
+// revocationReasonCodes is a map between string reason codes
+// to integers as defined in RFC 5280
+var revocationReasonCodes = map[string]int{
+	"unspecified":          ocsp.Unspecified,
+	"keycompromise":        ocsp.KeyCompromise,
+	"cacompromise":         ocsp.CACompromise,
+	"affiliationchanged":   ocsp.AffiliationChanged,
+	"superseded":           ocsp.Superseded,
+	"cessationofoperation": ocsp.CessationOfOperation,
+	"certificatehold":      ocsp.CertificateHold,
+	"removefromcrl":        ocsp.RemoveFromCRL,
+	"privilegewithdrawn":   ocsp.PrivilegeWithdrawn,
+	"aacompromise":         ocsp.AACompromise,
+}
 
 // StatusCode is a map between string statuses sent by cli/api
 // to ocsp int statuses
@@ -35,6 +53,15 @@ type SignRequest struct {
 	Status      string
 	Reason      int
 	RevokedAt   time.Time
+	Extensions  []pkix.Extension
+	// IssuerHash is the hashing function used to hash the issuer subject and public key
+	// in the OCSP response. Valid values are crypto.SHA1, crypto.SHA256, crypto.SHA384,
+	// and crypto.SHA512. If zero, the default is crypto.SHA1.
+	IssuerHash crypto.Hash
+	// If provided ThisUpdate will override the default usage of time.Now().Truncate(time.Hour)
+	ThisUpdate *time.Time
+	// If provided NextUpdate will override the default usage of ThisUpdate.Add(signerInterval)
+	NextUpdate *time.Time
 }
 
 // Signer represents a general signer of OCSP responses.  It is
@@ -56,11 +83,32 @@ type StandardSigner struct {
 	interval  time.Duration
 }
 
+// ReasonStringToCode tries to convert a reason string to an integer code
+func ReasonStringToCode(reason string) (reasonCode int, err error) {
+	// default to 0
+	if reason == "" {
+		return 0, nil
+	}
+
+	reasonCode, present := revocationReasonCodes[strings.ToLower(reason)]
+	if !present {
+		reasonCode, err = strconv.Atoi(reason)
+		if err != nil {
+			return
+		}
+		if reasonCode >= ocsp.AACompromise || reasonCode <= ocsp.Unspecified {
+			return 0, cferr.New(cferr.OCSPError, cferr.InvalidStatus)
+		}
+	}
+
+	return
+}
+
 // NewSignerFromFile reads the issuer cert, the responder cert and the responder key
 // from PEM files, and takes an interval in seconds
 func NewSignerFromFile(issuerFile, responderFile, keyFile string, interval time.Duration) (Signer, error) {
 	log.Debug("Loading issuer cert: ", issuerFile)
-	issuerBytes, err := ioutil.ReadFile(issuerFile)
+	issuerBytes, err := helpers.ReadBytes(issuerFile)
 	if err != nil {
 		return nil, err
 	}
@@ -116,13 +164,24 @@ func (s StandardSigner) Sign(req SignRequest) ([]byte, error) {
 	if bytes.Compare(req.Certificate.RawIssuer, s.issuer.RawSubject) != 0 {
 		return nil, cferr.New(cferr.OCSPError, cferr.IssuerMismatch)
 	}
-	if req.Certificate.CheckSignatureFrom(s.issuer) != nil {
-		return nil, cferr.New(cferr.OCSPError, cferr.IssuerMismatch)
+
+	err := req.Certificate.CheckSignatureFrom(s.issuer)
+	if err != nil {
+		return nil, cferr.Wrap(cferr.OCSPError, cferr.VerifyFailed, err)
 	}
 
-	// Round thisUpdate times down to the nearest hour
-	thisUpdate := time.Now().Truncate(time.Hour)
-	nextUpdate := thisUpdate.Add(s.interval)
+	var thisUpdate, nextUpdate time.Time
+	if req.ThisUpdate != nil {
+		thisUpdate = *req.ThisUpdate
+	} else {
+		// Round thisUpdate times down to the nearest hour
+		thisUpdate = time.Now().Truncate(time.Hour)
+	}
+	if req.NextUpdate != nil {
+		nextUpdate = *req.NextUpdate
+	} else {
+		nextUpdate = thisUpdate.Add(s.interval)
+	}
 
 	status, ok := StatusCode[req.Status]
 	if !ok {
@@ -138,11 +197,13 @@ func (s StandardSigner) Sign(req SignRequest) ([]byte, error) {
 	}
 
 	template := ocsp.Response{
-		Status:       status,
-		SerialNumber: req.Certificate.SerialNumber,
-		ThisUpdate:   thisUpdate,
-		NextUpdate:   nextUpdate,
-		Certificate:  certificate,
+		Status:          status,
+		SerialNumber:    req.Certificate.SerialNumber,
+		ThisUpdate:      thisUpdate,
+		NextUpdate:      nextUpdate,
+		Certificate:     certificate,
+		ExtraExtensions: req.Extensions,
+		IssuerHash:      req.IssuerHash,
 	}
 
 	if status == ocsp.Revoked {

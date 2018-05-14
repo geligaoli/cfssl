@@ -6,12 +6,24 @@ import (
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
+	"io/ioutil"
 	"testing"
 
 	"github.com/cloudflare/cfssl/errors"
 	"github.com/cloudflare/cfssl/helpers"
 )
+
+//TestNew validate the CertificateRequest created to return with a BasicKeyRequest
+//in KeyRequest field
+
+func TestNew(t *testing.T) {
+
+	if cr := New(); cr.KeyRequest == nil {
+		t.Fatalf("Should create a new, empty certificate request with BasicKeyRequest")
+	}
+}
 
 // TestBasicKeyRequest ensures that key generation returns the same type of
 // key specified in the BasicKeyRequest.
@@ -25,11 +37,11 @@ func TestBasicKeyRequest(t *testing.T) {
 	switch priv.(type) {
 	case *rsa.PrivateKey:
 		if kr.Algo() != "rsa" {
-			t.Fatal("RSA key generated, but expected", kr.Algo)
+			t.Fatal("RSA key generated, but expected", kr.Algo())
 		}
 	case *ecdsa.PrivateKey:
 		if kr.Algo() != "ecdsa" {
-			t.Fatal("ECDSA key generated, but expected", kr.Algo)
+			t.Fatal("ECDSA key generated, but expected", kr.Algo())
 		}
 	}
 }
@@ -96,13 +108,138 @@ func TestParseRequest(t *testing.T) {
 				OU: "Systems Engineering",
 			},
 		},
-		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1"},
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1", "jdoe@example.com"},
 		KeyRequest: NewBasicKeyRequest(),
 	}
 
 	_, _, err := ParseRequest(cr)
 	if err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+// TestParseRequestCA ensures that a valid CA certificate request does not
+// error and the resulting CSR includes the BasicConstraint extension
+func TestParseRequestCA(t *testing.T) {
+	var cr = &CertificateRequest{
+		CN: "Test Common Name",
+		Names: []Name{
+			{
+				C:  "US",
+				ST: "California",
+				L:  "San Francisco",
+				O:  "CloudFlare, Inc.",
+				OU: "Systems Engineering",
+			},
+			{
+				C:  "GB",
+				ST: "London",
+				L:  "London",
+				O:  "CloudFlare, Inc",
+				OU: "Systems Engineering",
+			},
+		},
+		CA: &CAConfig{
+			PathLength:  0,
+			PathLenZero: true,
+		},
+		KeyRequest: NewBasicKeyRequest(),
+	}
+
+	csrBytes, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	block, _ := pem.Decode(csrBytes)
+	if block == nil {
+		t.Fatalf("%v", err)
+	}
+
+	if block.Type != "CERTIFICATE REQUEST" {
+		t.Fatalf("Incorrect block type: %s", block.Type)
+	}
+
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	found := false
+	for _, ext := range csr.Extensions {
+		if ext.Id.Equal(asn1.ObjectIdentifier{2, 5, 29, 19}) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.Fatalf("CSR did not include BasicConstraint Extension")
+	}
+}
+
+// TestParseRequestCANoPathlen ensures that a valid CA certificate request
+// with an unspecified pathlen does not error and the resulting CSR includes
+// the BasicConstraint extension
+func TestParseRequestCANoPathlen(t *testing.T) {
+	var cr = &CertificateRequest{
+		CN: "Test Common Name",
+		Names: []Name{
+			{
+				C:  "US",
+				ST: "California",
+				L:  "San Francisco",
+				O:  "CloudFlare, Inc.",
+				OU: "Systems Engineering",
+			},
+			{
+				C:  "GB",
+				ST: "London",
+				L:  "London",
+				O:  "CloudFlare, Inc",
+				OU: "Systems Engineering",
+			},
+		},
+		CA: &CAConfig{
+			PathLength:  0,
+			PathLenZero: false,
+		},
+		KeyRequest: NewBasicKeyRequest(),
+	}
+
+	csrBytes, _, err := ParseRequest(cr)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	block, _ := pem.Decode(csrBytes)
+	if block == nil {
+		t.Fatalf("%v", err)
+	}
+
+	if block.Type != "CERTIFICATE REQUEST" {
+		t.Fatalf("Incorrect block type: %s", block.Type)
+	}
+
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	found := false
+	for _, ext := range csr.Extensions {
+		if ext.Id.Equal(asn1.ObjectIdentifier{2, 5, 29, 19}) {
+			bc := &BasicConstraints{}
+			asn1.Unmarshal(ext.Value, bc)
+			if bc.IsCA == true && bc.MaxPathLen == -1 {
+				found = true
+				break
+			}
+		}
+	}
+
+	if !found {
+		t.Fatalf("CSR did not include BasicConstraint Extension")
 	}
 }
 
@@ -165,6 +302,7 @@ func TestRSAKeyGeneration(t *testing.T) {
 // 521; an invalid RSA key size is any size less than 2048 bits.
 func TestBadBasicKeyRequest(t *testing.T) {
 	kr := &BasicKeyRequest{"yolocrypto", 1024}
+
 	if _, err := kr.Generate(); err == nil {
 		t.Fatal("Key generation should fail with invalid algorithm")
 	} else if sa := kr.SigAlgo(); sa != x509.UnknownSignatureAlgorithm {
@@ -185,6 +323,14 @@ func TestBadBasicKeyRequest(t *testing.T) {
 		t.Fatal("The wrong signature algorithm was returned from SigAlgo!")
 	}
 
+	kr = &BasicKeyRequest{"tobig", 9216}
+
+	kr.A = "rsa"
+	if _, err := kr.Generate(); err == nil {
+		t.Fatal("Key generation should fail with invalid key size")
+	} else if sa := kr.SigAlgo(); sa != x509.SHA512WithRSA {
+		t.Fatal("The wrong signature algorithm was returned from SigAlgo!")
+	}
 }
 
 // TestDefaultBasicKeyRequest makes sure that certificate requests without
@@ -201,7 +347,7 @@ func TestDefaultBasicKeyRequest(t *testing.T) {
 			},
 		},
 		CN:    "cloudflare.com",
-		Hosts: []string{"cloudflare.com", "www.cloudflare.com"},
+		Hosts: []string{"cloudflare.com", "www.cloudflare.com", "jdoe@example.com"},
 	}
 	_, priv, err := ParseRequest(req)
 	if err != nil {
@@ -241,7 +387,7 @@ func TestRSACertRequest(t *testing.T) {
 			},
 		},
 		CN:         "cloudflare.com",
-		Hosts:      []string{"cloudflare.com", "www.cloudflare.com"},
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "jdoe@example.com"},
 		KeyRequest: &BasicKeyRequest{"rsa", 2048},
 	}
 	_, _, err := ParseRequest(req)
@@ -298,7 +444,7 @@ func TestGenerator(t *testing.T) {
 			},
 		},
 		CN:         "cloudflare.com",
-		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1"},
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1", "jdoe@example.com"},
 		KeyRequest: &BasicKeyRequest{"rsa", 2048},
 	}
 
@@ -326,6 +472,10 @@ func TestGenerator(t *testing.T) {
 	}
 
 	if len(csr.IPAddresses) != 1 {
+		t.Fatal("SAN parsing error")
+	}
+
+	if len(csr.EmailAddresses) != 1 {
 		t.Fatal("SAN parsing error")
 	}
 
@@ -368,7 +518,7 @@ func TestWeakCSR(t *testing.T) {
 			},
 		},
 		CN:         "cloudflare.com",
-		Hosts:      []string{"cloudflare.com", "www.cloudflare.com"},
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "jdoe@example.com"},
 		KeyRequest: &BasicKeyRequest{"rsa", 1024},
 	}
 	g := &Generator{testValidator}
@@ -429,7 +579,7 @@ func TestGenerate(t *testing.T) {
 			},
 		},
 		CN:         "cloudflare.com",
-		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1"},
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1", "jdoe@example.com"},
 		KeyRequest: &BasicKeyRequest{"ecdsa", 256},
 	}
 
@@ -448,12 +598,26 @@ func TestGenerate(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 
-	_, _, err = helpers.ParseCSR(csrPEM)
+	csr, _, err := helpers.ParseCSR(csrPEM)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
+
+	if len(csr.DNSNames) != 2 {
+		t.Fatal("SAN parsing error")
+	}
+
+	if len(csr.IPAddresses) != 1 {
+		t.Fatal("SAN parsing error")
+	}
+
+	if len(csr.EmailAddresses) != 1 {
+		t.Fatal("SAN parsing error")
+	}
 }
 
+// TestReGenerate ensures Regenerate() is abel to use the provided CSR as a template for signing a new
+// CSR using priv.
 func TestReGenerate(t *testing.T) {
 	var req = &CertificateRequest{
 		Names: []Name{
@@ -470,7 +634,7 @@ func TestReGenerate(t *testing.T) {
 		KeyRequest: &BasicKeyRequest{"ecdsa", 256},
 	}
 
-	csr, key, err := ParseRequest(req)
+	_, key, err := ParseRequest(req)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
@@ -480,12 +644,101 @@ func TestReGenerate(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 
-	csr, err = Generate(priv, req)
+	csr, err := Generate(priv, req)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
 
 	if _, _, err = helpers.ParseCSR(csr); err != nil {
 		t.Fatalf("%v", err)
+	}
+
+	_, err = Regenerate(priv, csr)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// TestBadReGenerator ensures that a request that fails the ParseCSR is
+// not processed.
+func TestBadReGenerate(t *testing.T) {
+	var req = &CertificateRequest{
+		Names: []Name{
+			{
+				C:  "US",
+				ST: "California",
+				L:  "San Francisco",
+				O:  "CloudFlare",
+				OU: "Systems Engineering",
+			},
+		},
+		CN:         "cloudflare.com",
+		Hosts:      []string{"cloudflare.com", "www.cloudflare.com", "192.168.0.1"},
+		KeyRequest: &BasicKeyRequest{"ecdsa", 256},
+	}
+
+	_, key, err := ParseRequest(req)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	priv, err := helpers.ParsePrivateKeyPEM(key)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	csr, err := Generate(priv, req)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	block := pem.Block{
+		Type: "CERTIFICATE REQUEST",
+		Headers: map[string]string{
+			"Location": "UCSD",
+		},
+		Bytes: csr,
+	}
+
+	csr = pem.EncodeToMemory(&block)
+
+	_, err = Regenerate(priv, csr)
+	if err == nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+var testECDSACertificateFile = "testdata/test-ecdsa-ca.pem"
+
+func TestExtractCertificateRequest(t *testing.T) {
+	certPEM, err := ioutil.ReadFile(testECDSACertificateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// must parse ok
+	cert, err := helpers.ParseCertificatePEM(certPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := ExtractCertificateRequest(cert)
+
+	if req.CN != "" {
+		t.Fatal("Bad Certificate Request!")
+	}
+
+	if len(req.Names) != 1 {
+		t.Fatal("Bad Certificate Request!")
+	}
+
+	name := req.Names[0]
+	if name.C != "US" || name.ST != "California" || name.O != "CloudFlare, Inc." ||
+		name.OU != "Test Certificate Authority" || name.L != "San Francisco" {
+		t.Fatal("Bad Certificate Request!")
+	}
+
+	if req.CA == nil || req.CA.PathLength != 2 {
+		t.Fatal("Bad Certificate Request!")
 	}
 }

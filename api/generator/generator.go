@@ -12,12 +12,23 @@ import (
 	"net/http"
 
 	"github.com/cloudflare/cfssl/api"
+	"github.com/cloudflare/cfssl/bundler"
 	"github.com/cloudflare/cfssl/config"
 	"github.com/cloudflare/cfssl/csr"
 	"github.com/cloudflare/cfssl/errors"
 	"github.com/cloudflare/cfssl/log"
 	"github.com/cloudflare/cfssl/signer"
 	"github.com/cloudflare/cfssl/signer/universal"
+)
+
+const (
+	// CSRNoHostMessage is used to alert the user to a certificate lacking a hosts field.
+	CSRNoHostMessage = `This certificate lacks a "hosts" field. This makes it unsuitable for
+websites. For more information see the Baseline Requirements for the Issuance and Management
+of Publicly-Trusted Certificates, v.1.1.6, from the CA/Browser Forum (https://cabforum.org);
+specifically, section 10.2.3 ("Information Requirements").`
+	// NoBundlerMessage is used to alert the user that the server does not have a bundler initialized.
+	NoBundlerMessage = `This request requires a bundler, but one is not initialized for the API server.`
 )
 
 // Sum contains digests for a certificate or certificate request.
@@ -101,6 +112,7 @@ func (g *Handler) Handle(w http.ResponseWriter, r *http.Request) error {
 		log.Warningf("failed to read request body: %v", err)
 		return errors.NewBadRequest(err)
 	}
+	r.Body.Close()
 
 	req := new(csr.CertificateRequest)
 	req.KeyRequest = csr.NewBasicKeyRequest()
@@ -144,6 +156,7 @@ func (g *Handler) Handle(w http.ResponseWriter, r *http.Request) error {
 // sending the CSR to the server.
 type CertGeneratorHandler struct {
 	generator *csr.Generator
+	bundler   *bundler.Bundler
 	signer    signer.Signer
 }
 
@@ -193,10 +206,17 @@ func NewCertGeneratorHandlerFromSigner(validator Validator, signer signer.Signer
 	}
 }
 
+// SetBundler allows injecting an optional Bundler into the CertGeneratorHandler.
+func (cg *CertGeneratorHandler) SetBundler(caBundleFile, intBundleFile string) (err error) {
+	cg.bundler, err = bundler.NewBundler(caBundleFile, intBundleFile)
+	return err
+}
+
 type genSignRequest struct {
 	Request *csr.CertificateRequest `json:"request"`
 	Profile string                  `json:"profile"`
 	Label   string                  `json:"label"`
+	Bundle  bool                    `json:"bundle"`
 }
 
 // Handle responds to requests for the CA to generate a new private
@@ -206,11 +226,14 @@ func (cg *CertGeneratorHandler) Handle(w http.ResponseWriter, r *http.Request) e
 	log.Info("request for CSR")
 
 	req := new(genSignRequest)
+	req.Request = csr.New()
+
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		log.Warningf("failed to read request body: %v", err)
 		return errors.NewBadRequest(err)
 	}
+	r.Body.Close()
 
 	err = json.Unmarshal(body, req)
 	if err != nil {
@@ -266,22 +289,31 @@ func (cg *CertGeneratorHandler) Handle(w http.ResponseWriter, r *http.Request) e
 			"certificate":         certSum,
 		},
 	}
+
+	if req.Bundle {
+		if cg.bundler == nil {
+			return api.SendResponseWithMessage(w, result, NoBundlerMessage,
+				errors.New(errors.PolicyError, errors.InvalidRequest).ErrorCode)
+		}
+
+		bundle, err := cg.bundler.BundleFromPEMorDER(certBytes, nil, bundler.Optimal, "")
+		if err != nil {
+			return err
+		}
+
+		result["bundle"] = bundle
+	}
+
+	if len(req.Request.Hosts) == 0 {
+		return api.SendResponseWithMessage(w, result, CSRNoHostMessage,
+			errors.New(errors.PolicyError, errors.InvalidRequest).ErrorCode)
+	}
+
 	return api.SendResponse(w, result)
 }
 
-// CSRValidate contains the default validation logic for certificate requests to
-// the API server. This follows the Baseline Requirements for the Issuance and
-// Management of Publicly-Trusted Certificates, v.1.1.6, from the CA/Browser
-// Forum (https://cabforum.org). Specifically, section 10.2.3 ("Information
-// Requirements"), states:
-//
-// "Applicant information MUST include, but not be limited to, at least one
-// Fully-Qualified Domain Name or IP address to be included in the Certificate’s
-// SubjectAltName extension."
+// CSRValidate does nothing and will never return an error. It exists because NewHandler
+// requires a Validator as a parameter.
 func CSRValidate(req *csr.CertificateRequest) error {
-	if len(req.Hosts) == 0 {
-		log.Warning("request for CSR is missing the host parameter")
-		return errors.NewBadRequestMissingParameter("hosts")
-	}
 	return nil
 }

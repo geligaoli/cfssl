@@ -1,16 +1,23 @@
 package helpers
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"io/ioutil"
 	"math"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ocsp"
+
+	"github.com/google/certificate-transparency-go"
 )
 
 const (
@@ -29,15 +36,19 @@ const (
 	testEncryptedPrivateKey      = "testdata/enc_priv_key.pem"
 	testEmptyPem                 = "testdata/empty.pem"
 	testNoHeaderCert             = "testdata/noheadercert.pem"
-	testSinglePKCS7              = "testdata/cert_pkcs7.pem"
+	testSinglePKCS7              = "testdata/cert_pkcs7.pem"  // openssl crl2pkcs7 -nocrl -out cert_pkcs7.pem -in cert.pem
+	testEmptyPKCS7DER            = "testdata/empty_pkcs7.der" // openssl crl2pkcs7 -nocrl -out empty_pkcs7.der -outform der
+	testEmptyPKCS7PEM            = "testdata/empty_pkcs7.pem" // openssl crl2pkcs7 -nocrl -out empty_pkcs7.pem -outform pem
 	testMultiplePKCS7            = "testdata/bundle_pkcs7.pem"
 	testPKCS12EmptyPswd          = "testdata/emptypasswordpkcs12.p12"
 	testPKCS12Passwordispassword = "testdata/passwordpkcs12.p12"
 	testPKCS12MultipleCerts      = "testdata/multiplecerts.p12"
+	testCSRPEM                   = "testdata/test.csr.pem"
+	testCSRPEMBad                = "testdata/test.bad.csr.pem"
 )
 
 func TestParseCertificatesDER(t *testing.T) {
-	var password = []string{"password", "", "", "multiple"}
+	var password = []string{"password", "", ""}
 	for i, testFile := range []string{testPKCS12Passwordispassword, testPKCS12EmptyPswd, testCertDERFile} {
 		testDER, err := ioutil.ReadFile(testFile)
 		if err != nil {
@@ -52,6 +63,14 @@ func TestParseCertificatesDER(t *testing.T) {
 		}
 	}
 
+	testDER, err := ioutil.ReadFile(testEmptyPKCS7DER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PKCS7 with no certificates
+	if _, _, err := ParseCertificatesDER(testDER, ""); err == nil {
+		t.Fatal(err)
+	}
 }
 
 func TestKeyLength(t *testing.T) {
@@ -90,7 +109,7 @@ func TestKeyLength(t *testing.T) {
 
 func TestExpiryTime(t *testing.T) {
 	// nil case
-	var expNil *time.Time
+	var expNil time.Time
 	inNil := []*x509.Certificate{}
 	outNil := ExpiryTime(inNil)
 	if expNil != outNil {
@@ -105,11 +124,8 @@ func TestExpiryTime(t *testing.T) {
 	}
 	expected := time.Date(2014, time.April, 15, 0, 0, 0, 0, time.UTC)
 	out := ExpiryTime(certs)
-	if out == nil {
-		t.Fatal("Expiry time returning null")
-	}
-	if *out != expected {
-		t.Fatalf("Expected %v, got %v", expected, *out)
+	if out != expected {
+		t.Fatalf("Expected %v, got %v", expected, out)
 	}
 }
 
@@ -135,7 +151,7 @@ func TestMonthsValid(t *testing.T) {
 	}
 }
 
-func HasValidExpiry(t *testing.T) {
+func TestHasValidExpiry(t *testing.T) {
 	// Issue period > April 1, 2015
 	var cert = &x509.Certificate{
 		NotBefore: time.Date(2015, time.April, 01, 0, 0, 0, 0, time.UTC),
@@ -257,10 +273,11 @@ func TestParseCertificatePEM(t *testing.T) {
 		}
 
 		if _, err := ParseCertificatePEM(certPEM); err != nil {
+			t.Log(testFile)
 			t.Fatal(err)
 		}
 	}
-	for _, testFile := range []string{testBundleFile, testMessedUpCertFile, testEmptyCertFile, testMultiplePKCS7} {
+	for _, testFile := range []string{testBundleFile, testMessedUpCertFile, testEmptyPKCS7PEM, testEmptyCertFile, testMultiplePKCS7} {
 		certPEM, err := ioutil.ReadFile(testFile)
 		if err != nil {
 			t.Fatal(err)
@@ -281,13 +298,14 @@ func TestParseCertificatesPEM(t *testing.T) {
 		}
 
 		if _, err := ParseCertificatesPEM(bundlePEM); err != nil {
+			t.Log(testFile)
 			t.Fatal(err)
 		}
 	}
 
 	// test failure cases
 	// few lines deleted, then headers removed
-	for _, testFile := range []string{testMessedUpBundleFile, testNoHeaderCert} {
+	for _, testFile := range []string{testMessedUpBundleFile, testEmptyPKCS7PEM, testNoHeaderCert} {
 		bundlePEM, err := ioutil.ReadFile(testFile)
 		if err != nil {
 			t.Fatal(err)
@@ -377,4 +395,235 @@ func TestParseCSRPEM(t *testing.T) {
 		t.Fatalf("Expected an invalid CSR.")
 	}
 	in[12]--
+}
+
+func TestParseCSRPEMMore(t *testing.T) {
+	csrPEM, err := ioutil.ReadFile(testCSRPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ParseCSRPEM(csrPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	csrPEM, err = ioutil.ReadFile(testCSRPEMBad)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ParseCSRPEM(csrPEM); err == nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ParseCSRPEM([]byte("not even pem")); err == nil {
+		t.Fatal("Expected an invalid CSR.")
+	}
+}
+
+// Imported from signers/local/testdata/
+const rsaOldTestCSR = "testdata/rsa-old.csr"
+
+func TestParseOldCSR(t *testing.T) {
+	in, err := ioutil.ReadFile(rsaOldTestCSR)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	_, _, err = ParseCSR(in)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// Imported from signers/local/testdata/
+const clientCertFile = "testdata/ca.pem"
+const clientKeyFile = "testdata/ca_key.pem"
+
+func TestClientCertParams(t *testing.T) {
+	_, err := LoadClientCertificate(testCertFile, testPrivateRSAKey)
+	if err == nil {
+		t.Fatal("Unmatched cert/key should generate error")
+	}
+
+	cert, err := LoadClientCertificate("", "")
+	if err != nil || cert != nil {
+		t.Fatal("Certificate atempted to loaded with missing key and cert")
+	}
+	cert, err = LoadClientCertificate(clientCertFile, "")
+	if err != nil || cert != nil {
+		t.Fatal("Certificate atempted to loaded with missing key")
+	}
+	cert, err = LoadClientCertificate("", clientKeyFile)
+	if err != nil || cert != nil {
+		t.Fatal("Certificate atempted to loaded with missing cert")
+	}
+
+	cert, err = LoadClientCertificate(clientCertFile, clientKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert == nil {
+		t.Fatal("cert not created")
+	}
+}
+
+func TestLoadPEMCertPool(t *testing.T) {
+	certPool, err := PEMToCertPool([]byte{})
+	if certPool != nil || err != nil {
+		t.Fatal("Empty file name should not generate error or a cert pool")
+	}
+
+	in, err := ioutil.ReadFile(testEmptyPem)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	certPool, err = PEMToCertPool(in)
+	if certPool != nil {
+		t.Fatal("Empty file should not generate a cert pool")
+	} else if err == nil {
+		t.Fatal("Expected error for empty file")
+	}
+
+	in, err = ioutil.ReadFile(testEmptyCertFile)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	certPool, err = PEMToCertPool(in)
+	if certPool != nil {
+		t.Fatal("Empty cert should not generate a cert pool")
+	} else if err == nil {
+		t.Fatal("Expected error for empty cert")
+	}
+
+	in, err = ioutil.ReadFile(clientCertFile)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	certPool, err = PEMToCertPool(in)
+	if err != nil {
+		t.Fatalf("%v", err)
+	} else if certPool == nil {
+		t.Fatal("cert pool not created")
+	}
+}
+
+// sctEquals returns true if all fields of both SCTs are equivalent.
+func sctEquals(sctA, sctB ct.SignedCertificateTimestamp) bool {
+	if sctA.SCTVersion == sctB.SCTVersion &&
+		sctA.LogID == sctB.LogID &&
+		sctA.Timestamp == sctB.Timestamp &&
+		bytes.Equal(sctA.Extensions, sctB.Extensions) &&
+		sctA.Signature.Algorithm == sctB.Signature.Algorithm &&
+		bytes.Equal(sctA.Signature.Signature, sctA.Signature.Signature) {
+		return true
+	}
+	return false
+}
+
+// NOTE: TestDeserializeSCTList tests both DeserializeSCTList and
+// SerializeSCTList.
+func TestDeserializeSCTList(t *testing.T) {
+	// Here we make sure that empty SCT lists return an error
+	emptyLists := [][]byte{nil, {}}
+	for _, emptyList := range emptyLists {
+		_, err := DeserializeSCTList(emptyList)
+		if err == nil {
+			t.Fatalf("DeserializeSCTList(%v) should raise an error\n", emptyList)
+		}
+	}
+
+	// Here we make sure that an SCT list with a zero SCT is deserialized
+	// correctly
+	var zeroSCT ct.SignedCertificateTimestamp
+	serializedSCT, err := SerializeSCTList([]ct.SignedCertificateTimestamp{zeroSCT})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deserializedSCTList, err := DeserializeSCTList(serializedSCT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sctEquals(zeroSCT, (deserializedSCTList)[0]) {
+		t.Fatal("SCTs don't match")
+	}
+
+	// Here we verify that an error is raised when the SCT list length
+	// field is greater than its actual length
+	serializedSCT, err = SerializeSCTList([]ct.SignedCertificateTimestamp{zeroSCT})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serializedSCT[0] = 15
+	_, err = DeserializeSCTList(serializedSCT)
+	if err == nil {
+		t.Fatalf("DeserializeSCTList should raise an error when " +
+			"the SCT list length field and the list length don't match\n")
+	}
+
+	// Here we verify that an error is raised when the SCT list length
+	// field is less than its actual length
+	serializedSCT[0] = 0
+	serializedSCT[1] = 0
+	_, err = DeserializeSCTList(serializedSCT)
+	if err == nil {
+		t.Fatalf("DeserializeSCTList should raise an error when " +
+			"the SCT list length field and the list length don't match\n")
+	}
+
+	// Here we verify that an error is raised when the SCT length field is
+	// greater than its actual length
+	serializedSCT[0] = 0
+	serializedSCT[1] = 49
+	serializedSCT[2] = 1
+	_, err = DeserializeSCTList(serializedSCT)
+	if err == nil {
+		t.Fatalf("DeserializeSCTList should raise an error when " +
+			"the SCT length field and the SCT length don't match\n")
+	}
+
+	// Here we verify that an error is raised when the SCT length field is
+	// less than its actual length
+	serializedSCT[2] = 0
+	serializedSCT[3] = 0
+	_, err = DeserializeSCTList(serializedSCT)
+	if err == nil {
+		t.Fatalf("DeserializeSCTList should raise an error when " +
+			"the SCT length field and the SCT length don't match\n")
+	}
+}
+
+func TestSCTListFromOCSPResponse(t *testing.T) {
+	var response ocsp.Response
+	lst, err := SCTListFromOCSPResponse(&response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lst) != 0 {
+		t.Fatal("SCTListFromOCSPResponse should return an empty SCT list for an empty extension")
+	}
+
+	var zeroSCT ct.SignedCertificateTimestamp
+	serializedSCTList, err := SerializeSCTList([]ct.SignedCertificateTimestamp{zeroSCT})
+	if err != nil {
+		t.Fatal("failed to serialize SCT list")
+	}
+	serializedSCTList, err = asn1.Marshal(serializedSCTList)
+	if err != nil {
+		t.Fatal("failed to serialize SCT list")
+	}
+	// The value of Id below is the object identifier of the OCSP Stapling
+	// SCT extension (see section 3.3. of RFC 6962).
+	response.Extensions = []pkix.Extension{{
+		Id:       asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 11129, 2, 4, 5},
+		Critical: false,
+		Value:    serializedSCTList,
+	}}
+	lst, err = SCTListFromOCSPResponse(&response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sctEquals(zeroSCT, lst[0]) {
+		t.Fatal("SCTs don't match")
+	}
 }

@@ -1,7 +1,6 @@
 // Package revoke provides functionality for checking the validity of
 // a cert. Specifically, the temporal validity of the certificate is
-// checked first, then any CRL in the cert is checked. OCSP is not
-// supported at this time.
+// checked first, then any CRL and OCSP url in the cert is checked.
 package revoke
 
 import (
@@ -12,9 +11,11 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"io"
 	"io/ioutil"
 	"net/http"
 	neturl "net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ocsp"
@@ -28,13 +29,10 @@ import (
 // verification to fail (a hard failure).
 var HardFail = false
 
-// TODO (kyle): figure out a good mechanism for OCSP; this requires
-// presenting both the certificate and the issuer, and we don't have a
-// good way at this time of getting the issuer.
-
 // CRLSet associates a PKIX certificate list with the URL the CRL is
 // fetched from.
 var CRLSet = map[string]*pkix.CertificateList{}
+var crlLock = new(sync.Mutex)
 
 // We can't handle LDAP certificates, so this checks to see if the
 // URL string points to an LDAP resource so that we can ignore it.
@@ -82,17 +80,17 @@ func revCheck(cert *x509.Certificate) (revoked, ok bool) {
 			log.Info("certificate is revoked via CRL")
 			return true, true
 		}
+	}
 
-		if revoked, ok := certIsRevokedOCSP(cert, HardFail); !ok {
-			log.Warning("error checking revocation via OCSP")
-			if HardFail {
-				return true, false
-			}
-			return false, false
-		} else if revoked {
-			log.Info("certificate is revoked via OCSP")
-			return true, true
+	if revoked, ok := certIsRevokedOCSP(cert, HardFail); !ok {
+		log.Warning("error checking revocation via OCSP")
+		if HardFail {
+			return true, false
 		}
+		return false, false
+	} else if revoked {
+		log.Info("certificate is revoked via OCSP")
+		return true, true
 	}
 
 	return false, true
@@ -107,7 +105,7 @@ func fetchCRL(url string) (*pkix.CertificateList, error) {
 		return nil, errors.New("failed to retrieve CRL")
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := crlRead(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -116,13 +114,30 @@ func fetchCRL(url string) (*pkix.CertificateList, error) {
 	return x509.ParseCRL(body)
 }
 
+func getIssuer(cert *x509.Certificate) *x509.Certificate {
+	var issuer *x509.Certificate
+	var err error
+	for _, issuingCert := range cert.IssuingCertificateURL {
+		issuer, err = fetchRemote(issuingCert)
+		if err != nil {
+			continue
+		}
+		break
+	}
+
+	return issuer
+
+}
+
 // check a cert against a specific CRL. Returns the same bool pair
 // as revCheck.
 func certIsRevokedCRL(cert *x509.Certificate, url string) (revoked, ok bool) {
 	crl, ok := CRLSet[url]
 	if ok && crl == nil {
 		ok = false
+		crlLock.Lock()
 		delete(CRLSet, url)
+		crlLock.Unlock()
 	}
 
 	var shouldFetchCRL = true
@@ -132,6 +147,8 @@ func certIsRevokedCRL(cert *x509.Certificate, url string) (revoked, ok bool) {
 		}
 	}
 
+	issuer := getIssuer(cert)
+
 	if shouldFetchCRL {
 		var err error
 		crl, err = fetchCRL(url)
@@ -139,7 +156,19 @@ func certIsRevokedCRL(cert *x509.Certificate, url string) (revoked, ok bool) {
 			log.Warningf("failed to fetch CRL: %v", err)
 			return false, false
 		}
+
+		// check CRL signature
+		if issuer != nil {
+			err = issuer.CheckCRLSignature(crl)
+			if err != nil {
+				log.Warningf("failed to verify CRL: %v", err)
+				return false, false
+			}
+		}
+
+		crlLock.Lock()
 		CRLSet[url] = crl
+		crlLock.Unlock()
 	}
 
 	for _, revoked := range crl.TBSCertList.RevokedCertificates {
@@ -172,7 +201,7 @@ func fetchRemote(url string) (*x509.Certificate, error) {
 		return nil, err
 	}
 
-	in, err := ioutil.ReadAll(resp.Body)
+	in, err := remoteRead(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -199,17 +228,10 @@ func certIsRevokedOCSP(leaf *x509.Certificate, strict bool) (revoked, ok bool) {
 		return false, true
 	}
 
-	var issuer *x509.Certificate
-	for _, issuingCert := range leaf.IssuingCertificateURL {
-		issuer, err = fetchRemote(issuingCert)
-		if err != nil {
-			continue
-		}
-		break
-	}
+	issuer := getIssuer(leaf)
 
 	if issuer == nil {
-		return
+		return false, false
 	}
 
 	ocspRequest, err := ocsp.CreateRequest(leaf, issuer, &ocspOpts)
@@ -218,7 +240,7 @@ func certIsRevokedOCSP(leaf *x509.Certificate, strict bool) (revoked, ok bool) {
 	}
 
 	for _, server := range ocspURLs {
-		resp, err := sendOCSPRequest(server, ocspRequest, issuer)
+		resp, err := sendOCSPRequest(server, ocspRequest, leaf, issuer)
 		if err != nil {
 			if strict {
 				return
@@ -239,14 +261,12 @@ func certIsRevokedOCSP(leaf *x509.Certificate, strict bool) (revoked, ok bool) {
 	return
 }
 
-var ocspUnauthorised = []byte{0x30, 0x03, 0x0a, 0x01, 0x06}
-var ocspMalformed = []byte{0x30, 0x03, 0x0a, 0x01, 0x01}
-
 // sendOCSPRequest attempts to request an OCSP response from the
 // server. The error only indicates a failure to *fetch* the
 // certificate, and *does not* mean the certificate is valid.
-func sendOCSPRequest(server string, req []byte, issuer *x509.Certificate) (ocspResponse *ocsp.Response, err error) {
+func sendOCSPRequest(server string, req []byte, leaf, issuer *x509.Certificate) (*ocsp.Response, error) {
 	var resp *http.Response
+	var err error
 	if len(req) > 256 {
 		buf := bytes.NewBuffer(req)
 		resp, err = http.Post(server, "application/ocsp-request", buf)
@@ -256,26 +276,52 @@ func sendOCSPRequest(server string, req []byte, issuer *x509.Certificate) (ocspR
 	}
 
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return
+		return nil, errors.New("failed to retrieve OSCP")
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := ocspRead(resp.Body)
 	if err != nil {
-		return
+		return nil, err
 	}
 	resp.Body.Close()
 
-	if bytes.Equal(body, ocspUnauthorised) {
-		return
+	switch {
+	case bytes.Equal(body, ocsp.UnauthorizedErrorResponse):
+		return nil, errors.New("OSCP unauthorized")
+	case bytes.Equal(body, ocsp.MalformedRequestErrorResponse):
+		return nil, errors.New("OSCP malformed")
+	case bytes.Equal(body, ocsp.InternalErrorErrorResponse):
+		return nil, errors.New("OSCP internal error")
+	case bytes.Equal(body, ocsp.TryLaterErrorResponse):
+		return nil, errors.New("OSCP try later")
+	case bytes.Equal(body, ocsp.SigRequredErrorResponse):
+		return nil, errors.New("OSCP signature required")
 	}
 
-	if bytes.Equal(body, ocspMalformed) {
-		return
-	}
+	return ocsp.ParseResponseForCert(body, leaf, issuer)
+}
 
-	return ocsp.ParseResponse(body, issuer)
+var crlRead = ioutil.ReadAll
+
+// SetCRLFetcher sets the function to use to read from the http response body
+func SetCRLFetcher(fn func(io.Reader) ([]byte, error)) {
+	crlRead = fn
+}
+
+var remoteRead = ioutil.ReadAll
+
+// SetRemoteFetcher sets the function to use to read from the http response body
+func SetRemoteFetcher(fn func(io.Reader) ([]byte, error)) {
+	remoteRead = fn
+}
+
+var ocspRead = ioutil.ReadAll
+
+// SetOCSPFetcher sets the function to use to read from the http response body
+func SetOCSPFetcher(fn func(io.Reader) ([]byte, error)) {
+	ocspRead = fn
 }

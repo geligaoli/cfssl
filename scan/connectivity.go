@@ -2,13 +2,11 @@ package scan
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"strings"
-
-	"github.com/cloudflare/cf-tls/tls"
 )
 
 // Connectivity contains scanners testing basic connectivity to the host
@@ -55,7 +53,7 @@ var (
 )
 
 func initOnCloudFlareScan() ([]*net.IPNet, error) {
-	// Propogate previous errors and don't attempt to re-download.
+	// Propagate previous errors and don't attempt to re-download.
 	if cfNetsErr != nil {
 		return nil, cfNetsErr
 	}
@@ -80,7 +78,7 @@ func initOnCloudFlareScan() ([]*net.IPNet, error) {
 	}
 	defer v6resp.Body.Close()
 
-	scanner := bufio.NewScanner(io.MultiReader(v4resp.Body, strings.NewReader("\n"), v6resp.Body))
+	scanner := bufio.NewScanner(io.MultiReader(v4resp.Body, v6resp.Body))
 	for scanner.Scan() {
 		_, ipnet, err := net.ParseCIDR(scanner.Text())
 		if err != nil {
@@ -140,13 +138,24 @@ func tcpDialScan(addr, hostname string) (grade Grade, output Output, err error) 
 	return
 }
 
-// tlsDialScan tests that the host can perform a TLS Handshake.
+// tlsDialScan tests that the host can perform a TLS Handshake
+// and warns if the server's certificate can't be verified.
 func tlsDialScan(addr, hostname string) (grade Grade, output Output, err error) {
-	conn, err := tls.DialWithDialer(Dialer, Network, addr, defaultTLSConfig(hostname))
-	if err != nil {
+	var conn *tls.Conn
+	config := defaultTLSConfig(hostname)
+
+	if conn, err = tls.DialWithDialer(Dialer, Network, addr, config); err != nil {
 		return
 	}
 	conn.Close()
+
+	config.InsecureSkipVerify = false
+	if conn, err = tls.DialWithDialer(Dialer, Network, addr, config); err != nil {
+		grade = Warning
+		return
+	}
+	conn.Close()
+
 	grade = Good
 	return
 }

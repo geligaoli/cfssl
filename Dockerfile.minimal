@@ -1,45 +1,30 @@
-FROM gliderlabs/alpine:3.2
+FROM golang:1.9.2-alpine3.6
 
-WORKDIR /go/src/github.com/cloudflare/cfssl
-
-ENV GOPATH /go:/go/src/github.com/cloudflare/cfssl
+ENV GOPATH /go
 ENV USER root
 
-EXPOSE 8888
+COPY . /go/src/github.com/cloudflare/cfssl
 
-ENTRYPOINT ["/usr/bin/cfssl"]
+RUN set -x && \
+	apk --no-cache add git gcc libc-dev && \
+	go get github.com/cloudflare/cfssl_trust/... && \
+	go get github.com/GeertJohan/go.rice/rice && \
+	cd /go/src/github.com/cloudflare/cfssl && rice embed-go -i=./cli/serve && \
+	mkdir bin && cd bin && \
+	go build ../cmd/cfssl && \
+	go build ../cmd/cfssljson && \
+	go build ../cmd/mkbundle && \
+	go build ../cmd/multirootca && \
+	echo "Build complete."
 
-ADD . /go/src/github.com/cloudflare/cfssl
-
-RUN apk update && \
-    apk add go git gcc libc-dev libltdl libtool libgcc && \
-    echo "About go get..." && \
-    go get github.com/cloudflare/cf-tls/tls && \
-    go get github.com/cloudflare/go-metrics && \
-    go get github.com/cloudflare/redoctober/core && \
-    go get github.com/dgryski/go-rc2 && \
-    go get golang.org/x/crypto/ocsp && \
-    go get github.com/GeertJohan/go.rice && \
-    go get github.com/miekg/pkcs11 && \
-    echo "About build..." && \
-    (cd cmd/cfssl && go build . ) && \
-    (cd cmd/cfssljson && go build . ) && \
-    (cd cmd/mkbundle && go build . ) && \
-    (cd cmd/multirootca && go build . ) && \
-    echo "About copy binaries..." && \
-    mv cmd/cfssl/cfssl /usr/bin && \
-    mv cmd/cfssljson/cfssljson /usr/bin && \
-    mv cmd/mkbundle/mkbundle  /usr/bin && \
-    mv cmd/multirootca/multirootca  /usr/bin && \
-    echo "Cleaning up..." && \
-    apk del go git gcc libc-dev libtool libgcc && \
-    mv /go/src/github.com/cloudflare/cfssl/cli/serve/static /static && \
-    rm -rf /go && \
-    mkdir -p /go/src/github.com/cloudflare/cfssl/cli/serve && \
-    mv /static /go/src/github.com/cloudflare/cfssl/cli/serve/static && \
-    echo "Build complete."
-
+FROM alpine:3.6
+COPY --from=0 /go/src/github.com/cloudflare/cfssl_trust /etc/cfssl
+COPY --from=0 /go/src/github.com/cloudflare/cfssl/bin/ /usr/bin
 
 VOLUME [ "/etc/cfssl" ]
 WORKDIR /etc/cfssl
 
+EXPOSE 8888
+
+ENTRYPOINT ["cfssl"]
+CMD ["--help"]

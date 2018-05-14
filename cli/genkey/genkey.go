@@ -7,7 +7,6 @@ import (
 
 	"github.com/cloudflare/cfssl/cli"
 	"github.com/cloudflare/cfssl/csr"
-	cferr "github.com/cloudflare/cfssl/errors"
 	"github.com/cloudflare/cfssl/initca"
 )
 
@@ -28,6 +27,9 @@ func genkeyMain(args []string, c cli.Config) (err error) {
 	csrFile, args, err := cli.PopFirstArgument(args)
 	if err != nil {
 		return
+	}
+	if len(args) > 0 {
+		return errors.New("only one argument is accepted, please check with usage")
 	}
 
 	csrFileBytes, err := cli.ReadStdin(csrFile)
@@ -70,14 +72,11 @@ func genkeyMain(args []string, c cli.Config) (err error) {
 	return nil
 }
 
-// Validator returns true if the csr has at least one host
+// Validator does nothing and will never return an error. It exists because creating a
+// csr.Generator requires a Validator.
 func Validator(req *csr.CertificateRequest) error {
-	if len(req.Hosts) == 0 {
-		return cferr.Wrap(cferr.PolicyError, cferr.InvalidRequest, errors.New("missing hosts field"))
-	}
 	return nil
 }
 
-// CLIGenKey is a subcommand for generating a new key and CSR from a
-// JSON CSR request file.
+// Command assembles the definition of Command 'genkey'
 var Command = &cli.Command{UsageText: genkeyUsageText, Flags: genkeyFlags, Main: genkeyMain}
